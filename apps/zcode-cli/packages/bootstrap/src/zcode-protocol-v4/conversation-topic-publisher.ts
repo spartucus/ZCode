@@ -38,6 +38,7 @@ import {
 } from "@zcode/shared/zcode-protocol-v4";
 import {
   encodeConversationDeltasForLegacy,
+  conversationDeltasGrowthUpperBound,
   workflowRunDeltaGrowthUpperBound,
 } from "./conversation-workflow-run-deltas.js";
 import {
@@ -174,6 +175,14 @@ const HYDRATION_ACTION_BYTES_PER_WIRE_ROW = 128;
 const HYDRATION_EVENT_WIRE_OVERHEAD_BYTES = 64;
 // logical snapshot frame 中 sequence number 同时出现在 frame.toSeq 与 snapshot.seq。
 const HYDRATION_SEQUENCE_NUMBER_OCCURRENCES = 2;
+
+/**
+ * ingest 直接应用路径的保守预闸门余量：覆盖单条事件在 reducer 之上 materialize 出的
+ * subagent 镜像与命令 actions 行——它们从事件载荷派生、行数有界，512KiB 远超其
+ * 放大上限（hydration 侧对同一放大的预留是每行 128B）。载荷本身超过这个量级的事件
+ * （巨型工具输出）本就该走原子克隆路径，那里保留逐字节的精确闸门。
+ */
+const DIRECT_APPLY_GUARD_BYTES = 512 * 1024;
 
 function hydrationSequenceNumberBytes(sequenceNumber: number): number {
   return String(sequenceNumber).length * HYDRATION_SEQUENCE_NUMBER_OCCURRENCES;
@@ -539,10 +548,7 @@ export class ConversationTopicPublisher {
 
   /** 应用权威事件：投影推进 + 日志记账 + 扇出到各订阅者 flush buffer。 */
   ingest(event: SessionEvent): void {
-    const projectionLimit =
-      event.type === SessionEventType.TurnComplete || event.type === SessionEventType.TurnError
-        ? PROTOCOL_V4_LIMITS.logicalFrameAssemblyMaxBytes
-        : PROTOCOL_V4_LIMITS.logicalFrameAssemblyMaxBytes - PROJECTION_TERMINAL_RESERVE_BYTES;
+    const projectionLimit = this.projectionLimitForEvent(event);
     const streamingAppend = this.projection.establishedStreamingAppend(event);
     const streamingUpperBound =
       streamingAppend === null ? null : utf8JsonByteLength(streamingAppend) + 64;
@@ -554,24 +560,51 @@ export class ConversationTopicPublisher {
       deltas = this.projection.applyEvent(event);
       this.wireSnapshotBytesUpperBound += streamingUpperBound;
     } else {
-      let candidateBytes = 0;
-      let nextUpperBound = 0;
-      deltas = this.projection.applyEventAtomically(event, (snapshot, produced) => {
-        // dwf 快路径：这条事件只产键级增量时，它们的字节数就是快照增长的上界（一条 upsert
-        // 最多把自己那点内容加进去，removed 只会让快照变小），不必把整份快照再序列化一遍
-        // ——那一次 JSON.stringify 是每条引擎事件都要付的 MB 级开销，也是这次改造的另一半。
-        // 判据用的是**实际产出**而不是预演，所以 diff 退化出的整键 patch 自然落回精确路径。
-        const growth = workflowRunDeltaGrowthUpperBound(produced);
-        if (growth !== null && this.wireSnapshotBytesUpperBound + growth <= projectionLimit) {
-          nextUpperBound = this.wireSnapshotBytesUpperBound + growth;
-          return true;
-        }
-        candidateBytes = this.measureWireSnapshotBytes(this.getWireSnapshot(snapshot));
-        nextUpperBound = candidateBytes;
-        return candidateBytes <= projectionLimit;
-      });
-      if (deltas === null) throw new ProjectionPayloadTooLargeError(candidateBytes);
-      this.wireSnapshotBytesUpperBound = nextUpperBound;
+      // 这里曾经是唯一的慢路径：每条非流式事件都克隆整份投影（25 张全量 Map/Set）再对
+      // 全量 wire snapshot 做逐字节丈量，单事件成本 O(会话规模)、随事件数平方累积——
+      // 长会话 resume 后就是内存爆炸点（2026-10-10 实测：86k 事件的会话 resume 后
+      // 24 分钟内 anon 内存涨到 36GB 触发系统 OOM）。
+      // 修复依据：delta 的全部七种 op 都把新内容完整嵌在载荷里（row.appended/upserted
+      // 带整行、state.updated 带替换后的整键新值、removed 只会让快照变小），所以
+      // 「快照增长 ≤ 实际产出的 deltas 字节数 + 外壳余量」对任意事件成立。于是先直接
+      // 应用、再用实际 deltas 收紧上界，只有载荷巨大或确实逼近闸门的事件才回退到
+      // 原子克隆 + 精确丈量的原路径。
+      const payloadBytes = utf8JsonByteLength(event.payload ?? null);
+      if (
+        this.wireSnapshotBytesUpperBound + payloadBytes + DIRECT_APPLY_GUARD_BYTES >
+        projectionLimit
+      ) {
+        // wireSnapshotBytesUpperBound 只增不减，每条事件的余量都在累积漂移；触及闸门时
+        // 先用一次精确丈量重新锚定（只读当前快照，无需克隆）。丈量仍超限才说明快照
+        // 确实逼近 16MiB，此时才值得为原子性付一次全量克隆。
+        this.wireSnapshotBytesUpperBound = this.measureWireSnapshotBytes(this.getWireSnapshot());
+      }
+      if (
+        this.wireSnapshotBytesUpperBound + payloadBytes + DIRECT_APPLY_GUARD_BYTES <=
+        projectionLimit
+      ) {
+        deltas = this.projection.applyEvent(event);
+        this.wireSnapshotBytesUpperBound += conversationDeltasGrowthUpperBound(deltas);
+      } else {
+        let candidateBytes = 0;
+        let nextUpperBound = 0;
+        deltas = this.projection.applyEventAtomically(event, (snapshot, produced) => {
+          // dwf 快路径：这条事件只产键级增量时，它们的字节数就是快照增长的上界（一条 upsert
+          // 最多把自己那点内容加进去，removed 只会让快照变小），不必把整份快照再序列化一遍
+          // ——那一次 JSON.stringify 是每条引擎事件都要付的 MB 级开销，也是这次改造的另一半。
+          // 判据用的是**实际产出**而不是预演，所以 diff 退化出的整键 patch 自然落回精确路径。
+          const growth = workflowRunDeltaGrowthUpperBound(produced);
+          if (growth !== null && this.wireSnapshotBytesUpperBound + growth <= projectionLimit) {
+            nextUpperBound = this.wireSnapshotBytesUpperBound + growth;
+            return true;
+          }
+          candidateBytes = this.measureWireSnapshotBytes(this.getWireSnapshot(snapshot));
+          nextUpperBound = candidateBytes;
+          return candidateBytes <= projectionLimit;
+        });
+        if (deltas === null) throw new ProjectionPayloadTooLargeError(candidateBytes);
+        this.wireSnapshotBytesUpperBound = nextUpperBound;
+      }
     }
     this.log.push({ seq: event.sequenceNumber, deltas });
     while (this.log.length > this.retention) {
