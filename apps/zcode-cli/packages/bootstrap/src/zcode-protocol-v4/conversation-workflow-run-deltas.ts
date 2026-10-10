@@ -96,3 +96,19 @@ export function workflowRunDeltaGrowthUpperBound(
   }
   return utf8JsonByteLength(deltas) + WORKFLOW_RUN_DELTA_ENVELOPE_SLACK_BYTES;
 }
+
+/**
+ * 任意一批 delta 的快照增长字节上界——`workflowRunDeltaGrowthUpperBound` 的全集版。
+ *
+ * 上界对全部七种 op 成立：row.appended/upserted 把整行嵌进载荷、row.delta 嵌入 append
+ * 文本、state.updated 嵌入替换后的整键新值（增长 = 新值 − 旧值 ≤ 新值 ≤ 载荷字节数）、
+ * workflowRun.* 的 header 键整键替换与条目整条 upsert 同理；row.removed 与
+ * workflowRun.removed 只会让快照变小。seq/revision 十进制位数增长由外壳余量覆盖。
+ *
+ * 用途：publisher ingest 的直接应用路径在事件归约**之后**用它收紧快照字节上界——
+ * 判据读的是实际产出而不是预演，所以 reducer 之上 materialize 出的 subagent 镜像与
+ * 命令 actions 行也天然被计入，不会把 16MiB 闸门算松。
+ */
+export function conversationDeltasGrowthUpperBound(deltas: readonly ConversationDelta[]): number {
+  return utf8JsonByteLength(deltas) + WORKFLOW_RUN_DELTA_ENVELOPE_SLACK_BYTES;
+}

@@ -52,12 +52,28 @@ function markdownSyntaxRules(theme: TuiThemeTokens): ThemeTokenStyle[] {
   ];
 }
 
+// 修复 native 内存泄漏（2026-10-10 WSL OOM 案）：MarkdownText 每次 React 渲染都会调用
+// 本函数，而 SyntaxStyle.fromTheme 每次都在 native 侧（libopentui）新分配一套样式对象；
+// opentui 的 MarkdownRenderable setter 只换引用、不 destroy 旧值（归属约定：调用方负责
+// 释放），于是每个流式 token 触发的全树重渲染都给每个已挂载 markdown 实例泄漏一个
+// native SyntaxStyle（实测 32 条约 12KB/个；571 消息会话每轮渲染泄 ~3.5MB，
+// 70 分钟涨 ~6GB）。按 theme 对象缓存共享实例后，对象身份稳定、reconciler 不再触发
+// setter，泄漏与附带的全量重高亮同时消失。共享实例常驻不 destroy（挂载期间一直被
+// 引用）；theme 来自 BUILTIN_TUI_THEMES 常驻对象，WeakMap 仅防御未来动态主题。
+const markdownSyntaxStyleCache = new WeakMap<TuiThemeTokens, SyntaxStyle | undefined>();
+
 export function createMarkdownSyntaxStyle(theme: TuiThemeTokens): SyntaxStyle | undefined {
-  try {
-    return SyntaxStyle.fromTheme(markdownSyntaxRules(theme));
-  } catch {
-    return undefined;
+  if (markdownSyntaxStyleCache.has(theme)) {
+    return markdownSyntaxStyleCache.get(theme);
   }
+  let style: SyntaxStyle | undefined;
+  try {
+    style = SyntaxStyle.fromTheme(markdownSyntaxRules(theme));
+  } catch {
+    style = undefined;
+  }
+  markdownSyntaxStyleCache.set(theme, style);
+  return style;
 }
 
 function token(scope: string[], style: ThemeTokenStyle["style"]): ThemeTokenStyle {
